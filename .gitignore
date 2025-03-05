@@ -164,3 +164,10 @@ visualization/*
 
 # For Testing
 demo/
+
+# *.pt
+*.mp4
+temp_frames/
+*.json
+*.pt
+*.pth
