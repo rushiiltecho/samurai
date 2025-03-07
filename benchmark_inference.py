@@ -541,10 +541,203 @@ def cleanup(self):
 
 
 PATHS = {
-    "normal": "videos/90FPS_full_res_normal.mp4",
-    "edge": "videos/90FPS_full_res_edege.mp4",
+    "normal": "sam2_results/90FPS_full_res_normal.mp4",
+    "edge": "sam2_results/90FPS_full_res_edege.mp4",
 }
+
+def main_customization(camera_index=0, width=1280, height=720, fps=90, codec="MJPG", bbox_scale=1.35, req_fps=90):
+    global SAM2_PROCESSING
+    motion_session_started = False
+    motion_video_writer = None
+    motion_detector = MotionDetection()
+    is_fullscreen = True
+
+    # --------------------------
+    # New: Ask for desired processing dimensions and FPS
+    try:
+        desired_width = int(input("Enter desired processing width: "))
+        desired_height = int(input("Enter desired processing height: "))
+        desired_processing_fps = int(input("Enter desired processing FPS: "))
+    except Exception as e:
+        print("Invalid input, using default parameters.")
+        desired_width, desired_height, desired_processing_fps = width, height, req_fps
+    # --------------------------
+    
+    #  ======================================================================
+    NUM_OBJECTS = 1
+    SAM_CHECKPOINT_FILEPATH = "./sam2/checkpoints/sam2.1_hiera_base_plus.pt"
+    SAM_CONFIG_FILEPATH = determine_model_cfg(SAM_CHECKPOINT_FILEPATH)
+    DEVICE = "cuda"
+    sam = build_sam2_object_tracker(num_objects=NUM_OBJECTS,
+                                    config_file=SAM_CONFIG_FILEPATH,
+                                    ckpt_path=SAM_CHECKPOINT_FILEPATH,
+                                    device=DEVICE,
+                                    verbose=False
+                                    )
+    #  ======================================================================
+    # For real-time visualization, use desired processing resolution
+    visualizer = Visualizer(video_width=desired_width,
+                            video_height=desired_height
+                           )
+    # Initialize Camera
+    vid_path = "videos/the_video.mp4"
+    cap = cv2.VideoCapture(camera_index)
+    if isinstance(camera_index, int):
+        cap = configure_camera(cap, width, height, fps, codec)
+    if not cap or not cap.isOpened():
+        logging.error("Camera not initialized.")
+        return
+
+    # Determine the recorded fps from the capture device, fallback to fps parameter
+    recorded_fps = cap.get(cv2.CAP_PROP_FPS)
+    if recorded_fps <= 0:
+        recorded_fps = fps
+
+    # Calculate frame interval based on recorded fps & desired processing fps.
+    # For example, if recorded_fps=90 and desired_processing_fps=45 then sample every 2nd frame.
+    frame_interval = max(1, int(recorded_fps / desired_processing_fps))
+    
+    ret, frame = cap.read()
+    if not ret:
+        logging.error("Failed to read initial frame.")
+        return
+
+    # Create temporary directory for initialization
+    temp_dir = "temp_frames"
+    os.makedirs(temp_dir, exist_ok=True)
+    os.makedirs(f"{temp_dir}/state_space", exist_ok=True)
+    cv2.imwrite(os.path.join(temp_dir, "0.jpg"), frame)
+    
+    # Create fullscreen window for live feed
+    window_name = "Live Feed"
+    create_fullscreen_window(window_name)
+
+    # Hardcoded ROI points
+    roi_points = [(477, 311), (1120, 310), (1277, 625), (298, 630)]
+    if not roi_points:
+        logging.error("ROI selection canceled.")
+        return
+
+    roi_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+    cv2.fillPoly(roi_mask, [np.array(roi_points)], 255)
+
+    # Bounding box selection
+    bbox_points = None
+    while bbox_points is None:
+        bbox_points = select_points(frame, num_points=4, context_text="Select Object to Track", scale=bbox_scale)
+    
+    x_coords, y_coords = zip(*bbox_points)
+    x1, y1 = min(x_coords), min(y_coords)
+    x2, y2 = max(x_coords), max(y_coords)
+    sam_box = np.array([[x1, y1], [x2, y2]])
+    
+    print(f"Initial BBOX Points: {sam_box}, TYPE: {type(sam_box)}")
+    #=====================================================================
+    
+    try:
+        frame_idx = 0
+        
+        with torch.inference_mode(), torch.autocast('cuda', dtype=torch.bfloat16):
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                # Apply ROI mask and detect motion
+                motion_detector.motionUpdate(frame, roi_mask)
+
+                # Draw the enlarged bounding box on the live feed
+                copy_frame = frame.copy()
+                frame = draw_enlarged_bbox(frame, bbox_points, scale=bbox_scale)
+
+                if motion_detector.current_motion_status:
+                    # Process only every 'frame_interval' frame for inference
+                    if frame_idx % frame_interval == 0:
+                        FRAME_QUEUE.append(copy_frame)
+                    if frame_idx == 0:
+                        sam_out = sam.track_new_object(frame, box=sam_box)
+                    if len(FRAME_QUEUE) >= FRAME_QUEUE.maxlen and frame_idx > 0:
+                        pass
+                    sam_out = sam.track_all_objects(copy_frame)
+                    
+                    if not motion_session_started:
+                        if not os.path.exists("videos"):
+                            os.makedirs("videos")
+                        motion_video_path = os.path.join("videos", f"{datetime.datetime.now().strftime('%H%M%S_%d%m-%Y')}.mp4")
+                        out_video_path = os.path.join("videos", f"{datetime.datetime.now().strftime('%H%M%S_%d%m-%Y')}_out.mp4")
+                        # Use recorded_fps so that the output video matches the source capture rate
+                        motion_video_writer = cv2.VideoWriter(
+                            motion_video_path,
+                            cv2.VideoWriter_fourcc(*'mp4v'),
+                            recorded_fps,
+                            (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+                        )
+                        out_video_writer = cv2.VideoWriter(
+                            out_video_path,
+                            cv2.VideoWriter_fourcc(*'mp4v'),
+                            desired_processing_fps,
+                            (desired_width, desired_width)
+                        )
+                        motion_session_started = True
+                        logging.info(f"Started motion session: {motion_video_path}")
+
+                    # Resize frame for visualization based on desired processing dimensions.
+                    frame = visualizer.add_frame(frame=frame, mask=sam_out['pred_masks'])
+                    
+                    if motion_video_writer:
+                        motion_video_writer.write(copy_frame)
+                        out_video_writer.write(frame)
+                    frame_idx += 1
+                
+                elif motion_session_started:
+                    print("Motion Stopped")
+                    if motion_video_writer:
+                        motion_video_writer.release()
+                        logging.info(f"Stopped motion session: {motion_video_path}")
+                        frame_idx = 0
+                        FRAME_QUEUE.clear()
+                    motion_session_started = False
+                    if motion_video_writer:
+                        del motion_video_writer
+                    display_text(frame, "SAM2 Processing...", position=(10, 50), color=(0, 255, 255))
+                    show_frame(window_name, frame)
+                    cv2.waitKey(200)
+
+                    s_t = time.time()
+                    print("Inference time: ", time.time() - s_t)
+                    show_frame(window_name, frame)
+
+                status = "SAM2 Processing..." if SAM2_PROCESSING else "Live Feed"
+                display_text(frame, status)
+                show_frame(window_name, frame)
+
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    break
+                elif key == ord('f'):
+                    is_fullscreen = not is_fullscreen
+                    if is_fullscreen:
+                        cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+                    else:
+                        cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
+                    
+    finally:
+        def clean_dirs(temp_dir):    
+            for filename in os.listdir(temp_dir):
+                file_path = os.path.join(temp_dir, filename)
+                try:
+                    if os.path.isfile(file_path) or os.path.islink(file_path):
+                        os.unlink(file_path)
+                    elif os.path.isdir(file_path):
+                        os.rmdir(file_path)
+                except Exception as e:
+                    logging.error(f"Failed to delete {file_path}. Reason: {e}")
+        clean_dirs(f"{temp_dir}/state_space")
+        clean_dirs(temp_dir)
+        STOP_SIGNAL.set()
+        cap.release()
+        cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     camera_index = PATHS["normal"]
-    main(camera_index=camera_index, width=720, height=360, fps=90, codec="MJPG", bbox_scale=1.2)
+    main_customization(camera_index=2, width=1280, height=720, fps=120, codec="MJPG", bbox_scale=1.2)

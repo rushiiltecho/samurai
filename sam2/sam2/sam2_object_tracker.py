@@ -947,11 +947,24 @@ class SAM2ObjectTracker(SAM2Base):
         # Allocate tensors outside of the conditional block
         points = torch.zeros((self.num_objects, point.shape[1], point.shape[2]), device=self.device, dtype=torch.float32)
         labels = torch.zeros((self.num_objects, label.shape[1]), device=self.device, dtype=torch.int32)
-
+        
+        # =====================================================================
+        # MODIFIED CODE
+        # =====================================================================
+        # # Assign values to the current index (ensure single object tracking)
+        points[self.curr_obj_idx:self.curr_obj_idx + 1] = point[0:1]
+        labels[self.curr_obj_idx:self.curr_obj_idx + 1] = label[0:1]
+        # =====================================================================
+        # =====================================================================
+        
+        # ORIGINAL
         # Assign values to the current index
-        points[self.curr_obj_idx:self.curr_obj_idx + points.shape[0]] = point
-        labels[self.curr_obj_idx:self.curr_obj_idx + label.shape[0]] = label
-
+        # points[self.curr_obj_idx:self.curr_obj_idx + points.shape[0]] = point
+        # labels[self.curr_obj_idx:self.curr_obj_idx + label.shape[0]] = label
+        
+        # =====================================================================
+        # =====================================================================
+        
         # Scale the (normalized) coordinates by the model's internal image size
         points = points * self.image_size
 
