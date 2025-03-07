@@ -13,10 +13,10 @@ from motion import MotionDetection
 from samurai import determine_model_cfg, load_prompt, process_realtime_frame, process_video, process_frame
 import time
 sys.path.append("./sam2")
-from sam2.build_sam import build_sam2_video_predictor
+from sam2.build_sam import build_sam2_video_predictor,build_sam2_object_tracker
 
 # Global Declarations
-FRAME_QUEUE = deque(maxlen=10)
+FRAME_QUEUE = deque(maxlen=20)
 STOP_SIGNAL = threading.Event()  # Signal to stop the frame reader thread
 SAM2_PROCESSING = False  # Flag to indicate SAM2 processing
 
@@ -26,7 +26,15 @@ motion = MotionDetection()
 # Helper Functions
 def display_text(frame, text, position=(10, 30), color=(0, 255, 0)):
     """Helper function to display text on a frame."""
+    # now = time.time()
+    # while time.time() - now < 3:
     cv2.putText(frame, text, position, cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+
+def display_misc_text(frame, text, position=(10, 30), color=(0, 255, 0)):
+    """Helper function to display text on a frame."""
+    now = time.time()
+    while time.time() - now < 3:
+        cv2.putText(frame, text, position, cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
 
 def decode_fourcc(value):
     """Decode the FourCC codec value."""
@@ -194,8 +202,14 @@ def main(camera_index=0, width=1280, height=720, fps=90, codec="MJPG", bbox_scal
     motion_video_writer = None
     motion_detector = MotionDetection()
     is_fullscreen = True
-
+    # sam = build_sam2_object_tracker(num_objects=NUM_OBJECTS,
+    #                             config_file=SAM_CONFIG_FILEPATH,
+    #                             ckpt_path=SAM_CHECKPOINT_FILEPATH,
+    #                             device=DEVICE,
+    #                             verbose=False
+    #                             )
     # Initialize Camera
+    # cap = cv2.VideoCapture("videos/0ab0033b-a1d4-41b7-9012-b95887b02bf1.mp4")
     cap = cv2.VideoCapture(camera_index)
     cap = configure_camera(cap, width, height, fps, codec)
     if not cap or not cap.isOpened():
@@ -210,6 +224,7 @@ def main(camera_index=0, width=1280, height=720, fps=90, codec="MJPG", bbox_scal
     # Create temporary directory for initialization
     temp_dir = "temp_frames"
     os.makedirs(temp_dir, exist_ok=True)
+    os.makedirs(f"{temp_dir}/state_space", exist_ok=True)
     # Save first frame with numeric name instead of "frame_0.jpg"
     cv2.imwrite(os.path.join(temp_dir, "0.jpg"), frame)
     
@@ -240,106 +255,127 @@ def main(camera_index=0, width=1280, height=720, fps=90, codec="MJPG", bbox_scal
     #=====================================================================
     try:
         frame_idx = 0
+        
+        # with torch.inference_mode(), torch.autocast('cuda:0', dtype=torch.bfloat16):
         while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
+                ret, frame = cap.read()
+                if not ret:
+                    break
 
-            # Apply ROI mask and detect motion
-            motion_detector.motionUpdate(frame, roi_mask)
+                # Apply ROI mask and detect motion
+                motion_detector.motionUpdate(frame, roi_mask)
 
-            # Draw the enlarged bounding box on the live feed
-            copy_frame = frame.copy()
-            frame = draw_enlarged_bbox(frame, bbox_points, scale=bbox_scale)
+                # Draw the enlarged bounding box on the live feed
+                copy_frame = frame.copy()
+                frame = draw_enlarged_bbox(frame, bbox_points, scale=bbox_scale)
 
-            if motion_detector.current_motion_status:
-                # Add the frame to queue if the motion is detected:
-                FRAME_QUEUE.append(copy_frame)
-                # Initialize state if this is the first frame
-                if frame_idx == 0:
-                    state = predictor.init_state(temp_dir)
+                if motion_detector.current_motion_status:
+                    # Add the frame to queue if the motion is detected:
+                    if frame_idx % 2 == 0:
+                        FRAME_QUEUE.append(copy_frame)
+                        # Initialize state if this is the first frame
+                        if frame_idx == 0:
+                            state = predictor.init_state(temp_dir)
+                        
+                        # Process frame
+                        x_coords, y_coords = zip(*bbox_points)
+                        x1, y1 = min(x_coords), min(y_coords)
+                        w = max(x_coords) - x1
+                        h = max(y_coords) - y1
+                        prompts = load_prompt([x1, y1, w, h])
+                        if len(FRAME_QUEUE) >= FRAME_QUEUE.maxlen:
+                            # for i in range(len(FRAME_QUEUE)):
+                            #     cv2.imwrite(os.path.join(f"{temp_dir}/state_space", f"{i}.jpeg"), FRAME_QUEUE[i])
+                            # cv2.imwrite(os.path.join(f"{temp_dir}/state_space", "1.jpg"),FRAME_QUEUE[-1])
+                            # cv2.imwrite(os.path.join(f"{temp_dir}/state_space", "2.jpg"), FRAME_QUEUE[-1])                
+                            processed_frame_result = process_realtime_frame(
+                                frame=frame,
+                                predictor=predictor,
+                                prompts=prompts
+                            )
+                        # processed_frame = processed_frame_result["frame"]
+                        # frame = processed_frame
+                            motion_type = processed_frame_result["motion_type"]
+                            print("Motion Detected")
+                            if motion_type == "grab":
+                                display_text(frame, f"SAM2 Result: {motion_type}", position=(10, 90), color=(0, 255, 0))
+                        # cv2.waitKey(3000)
+                        if not motion_session_started:
+                            if not os.path.exists("videos"):
+                                os.makedirs("videos")
+                            motion_video_path = os.path.join("videos", f"{uuid.uuid4()}.mp4")
+                            motion_video_writer = cv2.VideoWriter(
+                                motion_video_path,
+                                cv2.VideoWriter_fourcc(*'mp4v'),
+                                fps,
+                                (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+                            )
+                            motion_session_started = True
+                            logging.info(f"Started motion session: {motion_video_path}")
+
+                    if motion_video_writer:
+                        motion_video_writer.write(copy_frame)
+                    frame_idx += 1
                 
-                # Process frame
-                x_coords, y_coords = zip(*bbox_points)
-                x1, y1 = min(x_coords), min(y_coords)
-                w = max(x_coords) - x1
-                h = max(y_coords) - y1
-                prompts = load_prompt([x1, y1, w, h])
-                processed_frame = process_realtime_frame(
-                    frame=frame,
-                    predictor=predictor,
-                    state=state,
-                    frame_idx=frame_idx,
-                    prompts=prompts
-                )
-                frame = processed_frame
-                print("Motion Detected")
-                if not motion_session_started:
-                    if not os.path.exists("videos"):
-                        os.makedirs("videos")
-                    motion_video_path = os.path.join("videos", f"{uuid.uuid4()}.mp4")
-                    motion_video_writer = cv2.VideoWriter(
-                        motion_video_path,
-                        cv2.VideoWriter_fourcc(*'mp4v'),
-                        fps,
-                        (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
-                    )
-                    motion_session_started = True
-                    logging.info(f"Started motion session: {motion_video_path}")
+                elif motion_session_started:
+                    print("Motion Stopped")
+                    if motion_video_writer:
+                        motion_video_writer.release()
+                        logging.info(f"Stopped motion session: {motion_video_path}")
+                        frame_idx = 0
+                        FRAME_QUEUE.clear()
+                    motion_session_started = False
+                    if motion_video_writer:
+                        del motion_video_writer
+                    # Process the recorded video with SAM2
+                    display_text(frame, "SAM2 Processing...", position=(10, 50), color=(0, 255, 255))
+                    show_frame(window_name, frame)
+                    cv2.waitKey(200)
 
-                if motion_video_writer:
-                    motion_video_writer.write(copy_frame)
-                frame_idx += 1
-            
-            elif motion_session_started:
-                print("Motion Stopped")
-                if motion_video_writer:
-                    motion_video_writer.release()
-                    logging.info(f"Stopped motion session: {motion_video_path}")
-                    frame_idx = 0
-                    FRAME_QUEUE.clear()
-                motion_session_started = False
+                    s_t = time.time()
+                    # motion_type = process_motion_session_with_sam2(
+                    #     motion_video_path, bbox_points, "./sam2/checkpoints/sam2.1_hiera_large.pt", "sam2_results"
+                    # )
+                    # print("Inference time: ", time.time() - s_t)
 
-                # Process the recorded video with SAM2
-                display_text(frame, "SAM2 Processing...", position=(10, 50), color=(0, 255, 255))
+                    # # Update display with SAM2 result
+                    # show_frame(window_name, frame)
+
+                # Display current state
+                status = "SAM2 Processing..." if SAM2_PROCESSING else "Live Feed"
+                display_text(frame, status)
                 show_frame(window_name, frame)
-                cv2.waitKey(200)
 
-                s_t = time.time()
-                # motion_type = process_motion_session_with_sam2(
-                #     motion_video_path, bbox_points, "./sam2/checkpoints/sam2.1_hiera_large.pt", "sam2_results"
-                # )
-                # print("Inference time: ", time.time() - s_t)
-
-                # # Update display with SAM2 result
-                # display_text(frame, f"SAM2 Result: {motion_type}", position=(10, 90), color=(0, 255, 0))
-                # show_frame(window_name, frame)
-                # cv2.waitKey(3000)
-
-            # Display current state
-            status = "SAM2 Processing..." if SAM2_PROCESSING else "Live Feed"
-            display_text(frame, status)
-            show_frame(window_name, frame)
-
-            # Handle keyboard input
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                break
-            elif key == ord('f'):  # Toggle fullscreen
-                is_fullscreen = not is_fullscreen
-                if is_fullscreen:
-                    cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-                else:
-                    cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
-            elif key == ord('r'):  # Re-select bounding box
-                bbox_points = select_points(frame, num_points=4, context_text="Re-select Object to Track", scale=bbox_scale)
-                if bbox_points:
-                    print(f"Updated BBOX Points: {bbox_points}")
+                # Handle keyboard input
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    break
+                elif key == ord('f'):  # Toggle fullscreen
+                    is_fullscreen = not is_fullscreen
+                    if is_fullscreen:
+                        cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+                    else:
+                        cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
+                elif key == ord('r'):  # Re-select bounding box
+                    bbox_points = select_points(frame, num_points=4, context_text="Re-select Object to Track", scale=bbox_scale)
+                    if bbox_points:
+                        print(f"Updated BBOX Points: {bbox_points}")
 
     finally:
+        # Clean up temporary directory
+        def clean_dirs(temp_dir):    
+            for filename in os.listdir(temp_dir):
+                file_path = os.path.join(temp_dir, filename)
+                try:
+                    if os.path.isfile(file_path) or os.path.islink(file_path):
+                        os.unlink(file_path)
+                    elif os.path.isdir(file_path):
+                        os.rmdir(file_path)
+                except Exception as e:
+                    logging.error(f"Failed to delete {file_path}. Reason: {e}")
+        clean_dirs(f"{temp_dir}/state_space")
+        clean_dirs(temp_dir)
         STOP_SIGNAL.set()
-        if motion_video_writer:
-            motion_video_writer.release()
         cap.release()
         cv2.destroyAllWindows()
 

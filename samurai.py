@@ -79,7 +79,7 @@ def classify_motion(bbox_sequence, frame_height, frame_width, threshold=0.9):
 # ===================================================================================
 # ===================================================================================
 color = [(255, 0, 0)]
-def process_realtime_frame(frame, predictor, state, frame_idx, prompts):
+def __process_realtime_frame(frame, predictor, state, frame_idx, prompts):
     """
     Process a single frame in real-time
     """
@@ -145,47 +145,269 @@ def process_realtime_frame(frame, predictor, state, frame_idx, prompts):
     
         # Classify the motion
         print(frame.shape)
+        print(bbox_sequence)
         frame_height, frame_width= frame.shape[:2]
         motion_type = classify_motion(bbox_sequence, frame_height, frame_width)
 
-        return img
+        return {
+                "frame": img, 
+                "motion_type": motion_type
+                }
     
 # ===================================================================================
 def process_frame(frame_queue, model_path, coords):
     pass
 # ===================================================================================
-def __process_realtime_frame(frame, predictor, state, frame_idx, prompts):
-    """Process a single frame in real-time"""
-    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
-        if frame_idx == 0:
-            # Initialize tracking with first frame
-            bbox, track_label = prompts[0]
-            _, _, masks = predictor.add_new_points_or_box(state, box=bbox, frame_idx=0, obj_id=0)
-        else:
-            # Propagate tracking to current frame
-            object_ids, masks = predictor.propagate_step(frame, frame_idx)
 
-        # Process masks and draw visualization
-        img = frame.copy()
-        if masks is not None:
-            for obj_id, mask in enumerate(masks):
+def process_realtime_frame(frame, predictor, prompts, save_video=True, output_path="demo.mp4"):
+    """
+    Process a single frame in real-time
+    """
+    frame_queue= deque(maxlen=10)
+    bbox_sequence = []
+    frame_rate = 30
+    frames_or_path = "temp_frames/state_space"
+    # Initialize video writer if saving output
+    frame_height, frame_width= frame.shape[:2]
+    if save_video:
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, frame_rate, (frame_width, frame_height))
+        
+        if isinstance(frames_or_path, str) and frames_or_path.endswith('.mp4'):
+            cap = cv2.VideoCapture(frames_or_path)
+            loaded_frames = []
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                loaded_frames.append(frame)
+            cap.release()
+        else:
+            frames = sorted([osp.join(frames_or_path, f) for f in os.listdir(frames_or_path) 
+                           if f.endswith((".jpg", ".jpeg", ".JPG", ".JPEG"))])
+            loaded_frames = [cv2.imread(frame_path) for frame_path in frames]
+
+    with torch.inference_mode(), torch.autocast('cuda',dtype=torch.float16):
+        state = predictor.init_state(f"temp_frames/state_space",offload_video_to_cpu=True)
+        bbox, track_label = prompts[0]
+        print(f"STATE: {state.keys()}")
+        __, __, masks = predictor.add_new_points_or_box(state, box=bbox, frame_idx=0, obj_id=0) 
+        print("MASKS:", masks)
+        for frame_idx, object_ids, masks in predictor.propagate_in_video(state):
+            print("Frame Index: ", frame_idx)
+            print("Object IDs: ", object_ids)
+            print("Masks: ", masks)
+            mask_to_vis = {}
+            bbox_to_vis = {}
+
+            for obj_id, mask in zip(object_ids, masks):
                 mask = mask[0].cpu().numpy()
                 mask = mask > 0.0
-                
-                # Draw mask overlay
-                mask_img = np.zeros_like(img)
-                mask_img[mask] = color[obj_id % len(color)]
-                img = cv2.addWeighted(img, 1, mask_img, 0.2, 0)
-
-                # Draw bounding box
                 non_zero_indices = np.argwhere(mask)
                 if len(non_zero_indices) > 0:
                     y_min, x_min = non_zero_indices.min(axis=0)
                     y_max, x_max = non_zero_indices.max(axis=0)
-                    cv2.rectangle(img, (x_min, y_min), (x_max, y_max), 
-                                color[obj_id % len(color)], 2)
+                    bbox = (x_min, y_min, x_max - x_min, y_max - y_min)
+                    
+                    if obj_id == 0:  # Track the first object
+                        bbox_sequence.append(bbox)
+                    
+                    bbox_to_vis[obj_id] = bbox
+                    mask_to_vis[obj_id] = mask
 
-        return img
+    # with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
+    #     if frame_idx == 0:
+    #         # Initialize tracking with first frame
+    #         bbox, track_label = prompts[0]
+    #         _, _, masks = predictor.add_new_points_or_box(state, box=bbox, frame_idx=0, obj_id=0)
+        
+    #     for frame_idx, object_ids, masks in predictor.propagate_in_video(state):
+    #         mask_to_vis = {}
+    #         bbox_to_vis = {}
+
+    #         for obj_id, mask in zip(object_ids, masks):
+    #             mask = mask[0].cpu().numpy()
+    #             mask = mask > 0.0
+    #             non_zero_indices = np.argwhere(mask)
+    #             if len(non_zero_indices) > 0:
+    #                 y_min, x_min = non_zero_indices.min(axis=0)
+    #                 y_max, x_max = non_zero_indices.max(axis=0)
+    #                 bbox = (x_min, y_min, x_max - x_min, y_max - y_min)
+                    
+    #                 if obj_id == 0:  # Track the first object
+    #                     bbox_sequence.append(bbox)
+                    
+    #                 bbox_to_vis[obj_id] = bbox
+    #                 mask_to_vis[obj_id] = mask
+
+                if save_video:
+                    img = loaded_frames[frame_idx].copy()
+                    for obj_id, mask in mask_to_vis.items():
+                        mask_img = np.zeros((frame_height, frame_width, 3), np.uint8)
+                        mask_img[mask] = color[(obj_id + 1) % len(color)]
+                        img = cv2.addWeighted(img, 1, mask_img, 0.2, 0)
+
+                    for obj_id, bbox in bbox_to_vis.items():
+                        cv2.rectangle(img, (bbox[0], bbox[1]), 
+                                    (bbox[0] + bbox[2], bbox[1] + bbox[3]), 
+                                    color[obj_id % len(color)], 2)
+
+                    out.write(img)
+                
+        # Process masks and draw visualization
+        # img = frame.copy()
+        # if masks is not None:
+        #     for obj_id, mask in zip(object_ids, masks):
+        #         mask = mask[0].cpu().numpy()
+        #         mask = mask > 0.0
+                
+        #         # Draw mask overlay
+        #         mask_img = np.zeros_like(img)
+        #         mask_img[mask] = color[obj_id % len(color)]
+        #         img = cv2.addWeighted(img, 1, mask_img, 0.2, 0)
+
+        #         # Draw bounding box
+        #         non_zero_indices = np.argwhere(mask)
+        #         if len(non_zero_indices) > 0:
+        #             y_min, x_min = non_zero_indices.min(axis=0)
+        #             y_max, x_max = non_zero_indices.max(axis=0)
+        #             cv2.rectangle(img, (x_min, y_min), (x_max, y_max), 
+        #                         color[obj_id % len(color)], 2)
+    
+    #     # Classify the motion
+    #     print(frame.shape)
+    #     print(bbox_sequence)
+        motion_type = classify_motion(bbox_sequence, frame_height, frame_width)
+
+        return {
+                # "frame": img, 
+                "motion_type": motion_type
+                }
+ 
+# def process_realtime_frame(frame, predictor, prompts, save_video=True, output_path="demo.mp4"):
+#     """
+#     Process a single frame in real-time with parallel processing
+#     """
+#     import concurrent.futures
+#     from functools import partial
+    
+#     frame_queue = deque(maxlen=10)
+#     bbox_sequence = []
+#     frame_rate = 30
+#     frames_or_path = "temp_frames/state_space"
+#     # Initialize video writer if saving output
+#     frame_height, frame_width = frame.shape[:2]
+#     loaded_frames = []
+    
+#     if save_video:
+#         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+#         out = cv2.VideoWriter(output_path, fourcc, frame_rate, (frame_width, frame_height))
+        
+#         if isinstance(frames_or_path, str) and frames_or_path.endswith('.mp4'):
+#             cap = cv2.VideoCapture(frames_or_path)
+#             while True:
+#                 ret, frame = cap.read()
+#                 if not ret:
+#                     break
+#                 loaded_frames.append(frame)
+#             cap.release()
+#         else:
+#             frames = sorted([osp.join(frames_or_path, f) for f in os.listdir(frames_or_path) 
+#                            if f.endswith((".jpg", ".jpeg", ".JPG", ".JPEG"))])
+#             loaded_frames = [cv2.imread(frame_path) for frame_path in frames]
+
+#     with torch.inference_mode(), torch.autocast('cuda', dtype=torch.float16):
+#         state = predictor.init_state(f"temp_frames/state_space", offload_video_to_cpu=True)
+#         bbox, track_label = prompts[0]
+#         print(f"STATE: {state.keys()}")
+#         __, __, masks = predictor.add_new_points_or_box(state, box=bbox, frame_idx=0, obj_id=0) 
+#         print("MASKS:", masks)
+        
+#         # Process frames in parallel
+#         results = []
+#         color = [(0, 0, 255), (0, 255, 0), (255, 0, 0), (255, 255, 0)]  # Assuming color is defined
+        
+#         # Define a function to process a single frame
+#         def process_frame(frame_data):
+#             frame_idx, object_ids, masks = frame_data
+#             mask_to_vis = {}
+#             bbox_to_vis = {}
+#             frame_bboxes = []
+            
+#             for obj_id, mask in zip(object_ids, masks):
+#                 mask = mask[0].cpu().numpy()
+#                 mask = mask > 0.0
+#                 non_zero_indices = np.argwhere(mask)
+#                 if len(non_zero_indices) > 0:
+#                     y_min, x_min = non_zero_indices.min(axis=0)
+#                     y_max, x_max = non_zero_indices.max(axis=0)
+#                     bbox = (x_min, y_min, x_max - x_min, y_max - y_min)
+                    
+#                     if obj_id == 0:  # Track the first object
+#                         frame_bboxes.append(bbox)
+                    
+#                     bbox_to_vis[obj_id] = bbox
+#                     mask_to_vis[obj_id] = mask
+            
+#             # Save video if needed
+#             if save_video and frame_idx < len(loaded_frames):
+#                 img = loaded_frames[frame_idx].copy()
+#                 for obj_id, mask in mask_to_vis.items():
+#                     mask_img = np.zeros((frame_height, frame_width, 3), np.uint8)
+#                     mask_img[mask] = color[(obj_id + 1) % len(color)]
+#                     img = cv2.addWeighted(img, 1, mask_img, 0.2, 0)
+
+#                 for obj_id, bbox in bbox_to_vis.items():
+#                     cv2.rectangle(img, (bbox[0], bbox[1]), 
+#                                 (bbox[0] + bbox[2], bbox[1] + bbox[3]), 
+#                                 color[obj_id % len(color)], 2)
+                
+#                 return {
+#                     "frame_idx": frame_idx,
+#                     "frame": img,
+#                     "bboxes": frame_bboxes
+#                 }
+            
+#             return {
+#                 "frame_idx": frame_idx,
+#                 "frame": None,
+#                 "bboxes": frame_bboxes
+#             }
+        
+#         # Create a thread pool for parallel processing
+#         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+#             # Collect all frame data first
+#             frame_data = list(predictor.propagate_in_video(state))
+            
+#             # Process frames in parallel
+#             future_results = list(executor.map(process_frame, frame_data))
+            
+#             # Sort results by frame index to maintain order
+#             future_results.sort(key=lambda x: x["frame_idx"])
+            
+#             # Write frames to video in order
+#             if save_video:
+#                 for result in future_results:
+#                     if result["frame"] is not None:
+#                         out.write(result["frame"])
+                    
+#                     # Collect bounding boxes for tracking
+#                     bbox_sequence.extend(result["bboxes"])
+#             else:
+#                 # Just collect bounding boxes if not saving video
+#                 for result in future_results:
+#                     bbox_sequence.extend(result["bboxes"])
+        
+#         if save_video:
+#             out.release()
+        
+#         # Classify the motion
+#         motion_type = classify_motion(bbox_sequence, frame_height, frame_width)
+
+#         return {
+#             "motion_type": motion_type
+#         }
+    
 # ===================================================================================
 # ===================================================================================
 
@@ -220,7 +442,7 @@ def process_video(video_path, coords, model_path="sam2/checkpoints/sam2.1_hiera_
             cap = cv2.VideoCapture(frames_or_path)
             frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            frame_rate = cap.get(cv2.CAP_PROP_FPS)
+            frame_rate = 30 #cap.get(cv2.CAP_PROP_FPS)
             print("SAM2 frame rate: ", frame_rate)
             cap.release()
         else:
@@ -256,6 +478,9 @@ def process_video(video_path, coords, model_path="sam2/checkpoints/sam2.1_hiera_
         _, _, masks = predictor.add_new_points_or_box(state, box=bbox, frame_idx=0, obj_id=0)
 
         for frame_idx, object_ids, masks in predictor.propagate_in_video(state):
+            print("Frame Index: ", frame_idx)
+            print("Object IDs: ", object_ids)
+            print("Masks: ", masks)
             mask_to_vis = {}
             bbox_to_vis = {}
 
