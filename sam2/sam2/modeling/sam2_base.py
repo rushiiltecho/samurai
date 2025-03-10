@@ -97,7 +97,7 @@ class SAM2Base(torch.nn.Module):
         sam_mask_decoder_extra_args=None,
         compile_image_encoder: bool = False,
         # Whether to use SAMURAI or original SAM 2
-        samurai_mode: bool = False,
+        samurai_mode: bool = True,
         # Hyperparameters for SAMURAI
         stable_frames_threshold: int = 15,
         stable_ious_threshold: float = 0.3,

@@ -13,6 +13,7 @@ from sam2.utils.kalman_filter import KalmanFilter
 
 
 class SAM2ObjectTracker(SAM2Base):
+
     def __init__(self,
                  num_objects=10,
                  verbose=True,
