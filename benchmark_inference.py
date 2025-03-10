@@ -11,6 +11,7 @@ import numpy as np
 from collections import deque
 
 import torch
+from gdino_vertical_stack import process_single_image
 from motion import MotionDetection
 from samurai import determine_model_cfg, load_prompt, process_realtime_frame, process_video, process_frame
 import time
@@ -254,7 +255,7 @@ PATHS = {
     "edge": "sam2_results/90FPS_full_res_edege.mp4",
 }
 
-def main_customization(camera_index=0, width=1280, height=720, fps=90, codec="MJPG", bbox_scale=1.35, req_fps=90):
+def main_without_thread_customization(camera_index=0, width=1280, height=720, fps=90, codec="MJPG", bbox_scale=1.35, req_fps=90):
     global SAM2_PROCESSING
     motion_session_started = False
     motion_video_writer = None
@@ -331,8 +332,12 @@ def main_customization(camera_index=0, width=1280, height=720, fps=90, codec="MJ
 
     # Bounding box selection
     bbox_points = None
-    while bbox_points is None:
-        bbox_points = select_points(frame, num_points=4, context_text="Select Object to Track", scale=bbox_scale)
+    os.makedirs('temp_frames/gdino_inference', exist_ok=True)
+    cv2.imwrite(os.path.join("temp_frames/gdino_inference", "__1.jpg"), frame)
+    bbox_points = process_single_image('temp_frames/gdino_inference/__1.jpg','temp_frames/gdino_inference/__1_infered.jpg', "medical paper, box")
+           
+    # while bbox_points is None:
+    #     bbox_points = select_points(frame, num_points=4, context_text="Select Object to Track", scale=bbox_scale)
     
     x_coords, y_coords = zip(*bbox_points)
     x1, y1 = min(x_coords), min(y_coords)
@@ -410,6 +415,10 @@ def main_customization(camera_index=0, width=1280, height=720, fps=90, codec="MJ
                         logging.info(f"Stopped motion session: {motion_video_path}")
                         frame_idx = 0
                         FRAME_QUEUE.clear()
+                        os.makedirs('temp_frames/gdino_inference', exist_ok=True)
+                        cv2.imwrite(os.path.join("temp_frames/gdino_inference", "__1.jpg"), frame)
+                        bbox_points = process_single_image('temp_frames/gdino_inference/__1.jpg','temp_frames/gdino_inference/__1_infered.jpg', "medical paper, box")
+           
                     motion_session_started = False
                     if motion_video_writer:
                         del motion_video_writer
@@ -452,9 +461,218 @@ def main_customization(camera_index=0, width=1280, height=720, fps=90, codec="MJ
         cap.release()
         cv2.destroyAllWindows()
 
+
+import threading
+import queue
+import time
+
+# Shared variables for tracking
+tracking_queue = queue.Queue(maxsize=5)  # Small queue size to prevent lag
+latest_output = None  # Shared variable to hold the latest tracking results
+tracking_lock = threading.Lock()  # Lock to ensure thread-safe updates to `latest_output`
+
+class TrackingThread(threading.Thread):
+    def __init__(self, sam, visualizer):
+        super().__init__()
+        self.sam = sam
+        self.visualizer = visualizer
+        self.stop_event = threading.Event()
+
+    def run(self):
+        global latest_output
+        while not self.stop_event.is_set():
+            try:
+                # Get a frame from the queue
+                frame = tracking_queue.get(timeout=1)  # Wait for 1 second for a frame
+                if frame is None:
+                    break
+
+                # Perform object tracking
+                with torch.inference_mode(), torch.autocast('cuda', dtype=torch.bfloat16):
+                    sam_out = self.sam.track_all_objects(frame)
+
+                # Update the latest output
+                with tracking_lock:
+                    latest_output = self.visualizer.add_frame(frame=frame, mask=sam_out['pred_masks'])
+
+            except queue.Empty:
+                continue  # No frame in the queue, continue waiting
+            except Exception as e:
+                logging.error(f"Error in tracking thread: {e}")
+                break
+
+    def stop(self):
+        self.stop_event.set()
+
+
+def main_customization(camera_index=0, width=1280, height=720, fps=90, codec="MJPG", bbox_scale=1.35, req_fps=90):
+    global SAM2_PROCESSING, latest_output
+    motion_session_started = False
+    motion_video_writer = None
+    motion_detector = MotionDetection()
+    is_fullscreen = True
+
+    # Initialize SAM2 and visualizer
+    NUM_OBJECTS = 1
+    SAM_CHECKPOINT_FILEPATH = "./sam2/checkpoints/sam2.1_hiera_large.pt"
+    SAM_CONFIG_FILEPATH = determine_model_cfg(SAM_CHECKPOINT_FILEPATH)
+    DEVICE = "cuda"
+    sam = build_sam2_object_tracker(num_objects=NUM_OBJECTS,
+                                    config_file=SAM_CONFIG_FILEPATH,
+                                    ckpt_path=SAM_CHECKPOINT_FILEPATH,
+                                    device=DEVICE,
+                                    verbose=False)
+    visualizer = Visualizer(video_width=width, video_height=height)
+
+    # Start the tracking thread
+    tracking_thread = TrackingThread(sam, visualizer)
+    tracking_thread.start()
+
+    # Initialize Camera
+    cap = cv2.VideoCapture(camera_index)
+    if isinstance(camera_index, int):
+        cap = configure_camera(cap, width, height, fps, codec)
+    if not cap or not cap.isOpened():
+        logging.error("Camera not initialized.")
+        return
+
+    recorded_fps = cap.get(cv2.CAP_PROP_FPS)
+    if recorded_fps <= 0:
+        recorded_fps = fps
+
+    frame_interval = max(1, int(recorded_fps / req_fps))
+
+    ret, frame = cap.read()
+    if not ret:
+        logging.error("Failed to read initial frame.")
+        return
+
+    # Create fullscreen window for live feed
+    window_name = "Live Feed"
+    create_fullscreen_window(window_name)
+
+    # Hardcoded ROI points
+    roi_points = [(477, 311), (1120, 310), (1277, 625), (298, 630)]
+    if not roi_points:
+        logging.error("ROI selection canceled.")
+        return
+
+    roi_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+    cv2.fillPoly(roi_mask, [np.array(roi_points)], 255)
+
+    # Bounding box selection
+    # bbox_points = None
+    # while bbox_points is None:
+    #     bbox_points = select_points(frame, num_points=4, context_text="Select Object to Track", scale=bbox_scale)
+    
+    cv2.imwrite(os.path.join("temp_frames/gdino_inference", "__1.jpg"), frame)
+    bbox_points = process_single_image('temp_frames/gdino_inference/__1.jpg','temp_frames/gdino_inference/__1_infered.jpg', "medical paper, box")
+           
+    x_coords, y_coords = zip(*bbox_points)
+    x1, y1 = min(x_coords), min(y_coords)
+    x2, y2 = max(x_coords), max(y_coords)
+    sam_box = np.array([[x1, y1], [x2, y2]])
+
+    print(f"Initial BBOX Points: {sam_box}, TYPE: {type(sam_box)}")
+
+    try:
+        frame_idx = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # Apply ROI mask and detect motion
+            motion_detector.motionUpdate(frame, roi_mask)
+
+            # Draw the enlarged bounding box on the live feed
+            copy_frame = frame.copy()
+            frame = draw_enlarged_bbox(frame, bbox_points, scale=bbox_scale)
+
+            if motion_detector.current_motion_status:
+                # Process only every 'frame_interval' frame for inference
+                if frame_idx % frame_interval == 0:
+                    if not tracking_queue.full():
+                        tracking_queue.put(copy_frame)  # Add frame to the tracking queue
+
+                if frame_idx == 0:
+                    sam_out = sam.track_new_object(frame, box=sam_box)
+
+                # Update the frame with the latest tracking results
+                with tracking_lock:
+                    if latest_output is not None:
+                        frame = latest_output
+
+                if not motion_session_started:
+                    if not os.path.exists("videos"):
+                        os.makedirs("videos")
+                    motion_video_path = os.path.join("videos", f"{datetime.datetime.now().strftime('%d%m-%Y_%H%M%S')}.mp4")
+                    out_video_path = os.path.join("videos", f"{datetime.datetime.now().strftime('%d%m-%Y_%H%M%S')}_out.mp4")
+                    motion_video_writer = cv2.VideoWriter(
+                        motion_video_path,
+                        cv2.VideoWriter_fourcc(*'mp4v'),
+                        recorded_fps,
+                        (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+                    )
+                    out_video_writer = cv2.VideoWriter(
+                        out_video_path,
+                        cv2.VideoWriter_fourcc(*'mp4v'),
+                        recorded_fps,
+                        (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+                    )
+                    motion_session_started = True
+                    logging.info(f"Started motion session: {motion_video_path}")
+
+                if motion_video_writer:
+                    motion_video_writer.write(copy_frame)
+                    out_video_writer.write(frame)
+                frame_idx += 1
+
+            elif motion_session_started:
+                print("Motion Stopped")
+                if motion_video_writer:
+                    motion_video_writer.release()
+                    logging.info(f"Stopped motion session: {motion_video_path}")
+                    frame_idx = 0
+                    os.makedirs("temp_frames/gdino_inference", exist_ok=True)
+                    cv2.imwrite(os.path.join("temp_frames/gdino_inference", "__1.jpg"), frame)
+                    process_single_image('temp_frames/gdino_inference/__1.jpg','temp_frames/gdino_inference/__1_infered.jpg', "medical paper, box")
+                motion_session_started = False
+
+            # Display the frame
+            show_frame(window_name, frame)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('f'):
+                is_fullscreen = not is_fullscreen
+                if is_fullscreen:
+                    cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+                else:
+                    cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
+
+    finally:
+        # Stop the tracking thread
+        tracking_thread.stop()
+        tracking_thread.join()
+
+        # Clean up resources
+        if motion_video_writer:
+            motion_video_writer.release()
+        cap.release()
+        cv2.destroyAllWindows()
+
+# if __name__ == "__main__":
+#     camera_index = PATHS["normal"]
+#     main_customization(camera_index=2, width=1280, height=720, fps=120, codec="MJPG", bbox_scale=1.2)
+
+
+
 if __name__ == "__main__":
     camera_index = PATHS["normal"]
-    main_customization(camera_index=2, width=1280, height=720, fps=120, codec="MJPG", bbox_scale=1.2)
+    main_without_thread_customization(camera_index=0, width=1280, height=720, fps=120, codec="MJPG", bbox_scale=1.2)
+    # main_customization(camera_index=2, width=1280, height=720, fps=90, codec="MJPG", bbox_scale=1.2)
     # ============================================================
     # ================= TO PROCESS IT WITH VIDEO =================
     # ============================================================
